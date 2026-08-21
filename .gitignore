@@ -1,0 +1,7 @@
+# Ignorar todo excepto scraper.py
+*
+!*/
+!scraper.py
+!.gitignore
+!README.md
+!CONTRIBUTING.md
