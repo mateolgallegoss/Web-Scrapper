@@ -26,7 +26,7 @@ Requisitos de instalación:
     playwright install chromium
 
 Uso:
-    python scraper.py
+   programas/python scraper.py
 """
 
 import asyncio
@@ -42,6 +42,15 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page
 from playwright.async_api import Error as PlaywrightError
+
+# Directorio base del proyecto (raíz, un nivel arriba de programas/)
+DIRECTORIO_PROYECTO = Path(__file__).resolve().parent.parent
+
+
+def resolver_ruta(ruta: str) -> Path:
+    """Resuelve una ruta relativa al directorio base del proyecto."""
+    p = Path(ruta)
+    return p if p.is_absolute() else DIRECTORIO_PROYECTO / p
 
 
 # ============================================================================
@@ -61,7 +70,7 @@ RETARDO_ENTRE_PETICIONES: float = 2.0
 PROFUNDIDAD_MAXIMA: int = 3
 
 # Límite máximo de páginas a procesar durante la ejecución.
-MAX_PAGINAS: int = 100
+MAX_PAGINAS: int = 300
 
 # Ruta del archivo de base de datos SQLite donde se guardarán los resultados.
 RUTA_BASE_DATOS: str = "scrapeo.db"
@@ -78,10 +87,13 @@ TIEMPO_ESPERA_NAVEGACION: float = 30_000
 # Útil para restringir el rastreo a un subdominio específico.
 DOMINIO_PERMITIDO: str = ""
 
+# Modo incremental: True = respeta BD y solo scrapea URLs nuevas,
+# False = forzar re-scrapeo (re-descarga y actualiza incluso si ya existe en BD).
+MODO_INCREMENTAL: bool = True
+
 # User agent realista y moderno para evitar ser detectado como bot.
 USER_AGENT: str = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 
@@ -420,7 +432,8 @@ class Crawler:
     async def _procesar_url(self, pagina: Page, url: str, profundidad: int) -> None:
         """Procesa una única URL: la visita, extrae datos y encola sus enlaces."""
         # Evita duplicados y bucles infinitos (memoria + base de datos).
-        if url in self.urls_procesadas or self.base_datos.url_existe(url):
+        if url in self.urls_procesadas:
+            logger.info("Omitiendo ya procesada en esta sesión: %s", url)
             return
         # Filtro estricto de dominio.
         if obtener_dominio(url) != self.dominio:
@@ -428,6 +441,67 @@ class Crawler:
         # Control de profundidad máxima.
         if profundidad > self.max_depth:
             return
+
+        existe = self.base_datos.url_existe(url)
+        if existe:
+            if MODO_INCREMENTAL:
+                # Modo incremental: no re-scrapea la página ya guardada,
+                # pero sí la re-explora para descubrir hijos nuevos (ej. posts nuevos en r/golang)
+                logger.info("Ya en BD, re-explorando hijos (incremental): %s", url)
+                self.urls_procesadas.add(url)
+                # Navegación ligera solo para extraer enlaces hijos
+                try:
+                    await pagina.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                    try:
+                        await pagina.wait_for_load_state("networkidle", timeout=7000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout al re-explorar (incremental): %s", url)
+                    return
+                except PlaywrightError as error:
+                    logger.warning("Error de navegación incremental en %s: %s", url, error)
+                    return
+                except Exception as error:
+                    logger.warning("Error inesperado incremental en %s: %s", url, error)
+                    return
+                try:
+                    html_completo: Optional[str] = None
+                    for intento in range(3):
+                        try:
+                            html_completo = await pagina.content()
+                            break
+                        except Exception as e:
+                            msg = str(e).lower()
+                            if "navigating" in msg or "unable to retrieve content" in msg:
+                                await asyncio.sleep(1.5)
+                                try:
+                                    await pagina.wait_for_load_state("networkidle", timeout=5000)
+                                except Exception:
+                                    pass
+                                continue
+                            raise
+                    if html_completo is None:
+                        logger.warning("No se pudo obtener content() incremental: %s", url)
+                        return
+                    # Solo encola hijos que aún no existen en BD ni en sesión
+                    if profundidad < self.max_depth:
+                        nuevos = 0
+                        for enlace in extraer_enlaces(html_completo, url, self.dominio):
+                            if enlace not in self.urls_procesadas and not self.base_datos.url_existe(enlace):
+                                await self.cola.put((enlace, profundidad + 1))
+                                nuevos += 1
+                        if nuevos:
+                            logger.info("Incremental: %d enlaces nuevos encolados desde %s", nuevos, url)
+                        else:
+                            logger.info("Incremental: sin enlaces nuevos desde %s", url)
+                except Exception as error:
+                    logger.error("Error incremental al extraer enlaces de %s: %s", url, error)
+                return
+            else:
+                logger.info("Forzando re-scrapeo de existente (MODO_INCREMENTAL=False): %s", url)
+                # cae al flujo normal y hará INSERT OR REPLACE
 
         self.urls_procesadas.add(url)
         logger.info("Procesando (nivel %d): %s", profundidad, url)
@@ -439,6 +513,13 @@ class Crawler:
                 wait_until="domcontentloaded",
                 timeout=self.timeout,
             )
+            # Páginas con JS pesado (ej. reddit) siguen navegando/redirigiendo
+            # tras domcontentloaded -> esperar a que se estabilice antes de content()
+            try:
+                await pagina.wait_for_load_state("networkidle", timeout=7000)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
         except asyncio.TimeoutError:
             logger.warning("Timeout al cargar la página: %s", url)
             return
@@ -451,8 +532,34 @@ class Crawler:
 
         try:
             # Extracción de datos: HTML renderizado, título, texto y JS.
-            html_completo: str = await pagina.content()
-            titulo: Optional[str] = await pagina.title()
+            # content() puede fallar si la página sigue navegando -> reintentos
+            html_completo: Optional[str] = None
+            for intento in range(3):
+                try:
+                    html_completo = await pagina.content()
+                    break
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "navigating" in msg or "unable to retrieve content" in msg:
+                        logger.warning(
+                            "Reintentando content() tras navegación (intento %d/3): %s",
+                            intento + 1,
+                            url,
+                        )
+                        await asyncio.sleep(1.5)
+                        try:
+                            await pagina.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                        continue
+                    raise
+            if html_completo is None:
+                logger.error("No se pudo obtener content() tras reintentos: %s", url)
+                return
+            try:
+                titulo: Optional[str] = await pagina.title()
+            except Exception:
+                titulo = None
             texto_limpio: str = extraer_texto_limpio(html_completo)
             javascript_codigo: str = extraer_javascript(html_completo)
 
@@ -504,7 +611,7 @@ class Crawler:
         carpeta y la lista de pares (tipo, ruta_archivo) para registrar en BD.
         """
         slug = generar_slug(url)
-        carpeta = Path(self.ruta_directorio_archivos) / slug
+        carpeta = resolver_ruta(self.ruta_directorio_archivos) / slug
         carpeta.mkdir(parents=True, exist_ok=True)
 
         archivos: list[tuple[str, str, str]] = [
@@ -534,7 +641,7 @@ def crear_ruta_ejecucion() -> str:
     independiente de las anteriores.
     """
     marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return str(Path(RUTA_DIRECTORIO_ARCHIVOS) / f"ejecucion_{marca_tiempo}")
+    return str(resolver_ruta(RUTA_DIRECTORIO_ARCHIVOS) / f"ejecucion_{marca_tiempo}")
 
 
 async def main() -> None:
@@ -546,7 +653,7 @@ async def main() -> None:
     ruta_directorio_archivos = crear_ruta_ejecucion()
     logger.info("Carpeta de archivos de esta ejecución: %s", ruta_directorio_archivos)
 
-    base_datos = BaseDatos(RUTA_BASE_DATOS)
+    base_datos = BaseDatos(str(resolver_ruta(RUTA_BASE_DATOS)))
     crawler = Crawler(
         url_inicial=URL_INICIAL,
         dominio=dominio,
@@ -566,6 +673,11 @@ async def main() -> None:
     logger.info(
         "Proceso finalizado. Páginas procesadas: %d", crawler.paginas_procesadas
     )
+    if crawler.paginas_procesadas == 0:
+        logger.warning(
+            "0 páginas procesadas. Si la URL ya fue scrapeada, borra '%s' o cambia URL_INICIAL para forzar re-scrapeo.",
+            RUTA_BASE_DATOS,
+        )
 
 
 if __name__ == "__main__":

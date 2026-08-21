@@ -1,8 +1,10 @@
-# Ignorar todo excepto scraper.py
+# Ignorar todo excepto programas y documentación
 *
 !*/
-!scraper.py
 !.gitignore
 !README.md
 !CONTRIBUTING.md
+!LICENSE
 !LICENSE.md
+!programas/
+!programas/*.py
