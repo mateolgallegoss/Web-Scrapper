@@ -159,6 +159,7 @@ def extraer_texto_limpio(html: str) -> str:
     considerados navegación (cabeceras, menús y pies de página), dejando
     únicamente el contenido textual legible por el usuario.
     """
+    # Repositorio propiedad de Misitox37
     sopa = BeautifulSoup(html, "html.parser")
 
     # Elimina elementos que no aportan texto visible.
@@ -321,6 +322,7 @@ class BaseDatos:
         return int(cursor.lastrowid)
 
     def guardar_archivo(self, pagina_id: int, tipo: str, ruta_archivo: str) -> None:
+    # Repositorio propiedad de Misitox37
         """Registra un archivo guardado en disco asociado a una página."""
         with self.conexion:
             self.conexion.execute(
